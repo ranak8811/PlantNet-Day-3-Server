@@ -6,6 +6,8 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const jwt = require("jsonwebtoken");
 const morgan = require("morgan");
 
+const nodemailer = require("nodemailer");
+
 const port = process.env.PORT || 4000;
 const app = express();
 // middleware
@@ -36,6 +38,53 @@ const verifyToken = async (req, res, next) => {
   });
 };
 
+//send email using nodemailer
+const sendEmail = (emailAddress, emailData) => {
+  // const emailData = {
+  //   subject: "This is a very important subject",
+  //   message: "Nice message",
+  // };
+
+  // create transporter
+  const transporter = nodemailer.createTransport({
+    host: "smtp.gmail.com",
+    port: 587,
+    secure: false, // true for port 465, false for other ports
+    auth: {
+      user: process.env.NODEMAILSER_USER,
+      pass: process.env.NODEMAILSER_PASS,
+    },
+  });
+
+  // verify connection
+  transporter.verify((error, success) => {
+    if (error) {
+      console.log(error);
+    } else {
+      console.log("Transporter is ready to take email: ", success);
+    }
+  });
+
+  // transporter.sendMail()
+  const mailBody = {
+    from: process.env.NODEMAILSER_USER, // sender address
+    to: emailAddress, // list of receivers
+    subject: emailData?.subject, // Subject line
+    // text: emailData?.message, // plain text body
+    html: `<p>${emailData?.message}</p>`, // html body
+  };
+
+  // send email
+  transporter.sendMail(mailBody, (error, info) => {
+    if (error) {
+      console.log(error);
+    } else {
+      // console.log(info);
+      console.log("Email sent successfully: ", info?.response);
+    }
+  });
+};
+
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.j5yqq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
@@ -53,8 +102,42 @@ async function run() {
     const plantsCollection = db.collection("plants");
     const ordersCollection = db.collection("orders");
 
+    // verify admin middleware
+    const verifyAdmin = async (req, res, next) => {
+      // console.log("data from verifySeller middleware--> ", req.user?.email);
+
+      const email = req.user?.email;
+      const query = { email };
+      const result = await usersCollection.findOne(query);
+
+      if (!result || result?.role !== "admin") {
+        res.status(403).send({
+          message: "Forbidden access! Admin only action!!",
+        });
+      }
+
+      next();
+    };
+    // verify seller middleware
+    const verifySeller = async (req, res, next) => {
+      // console.log("data from verifyAdmin middleware--> ", req.user?.email);
+
+      const email = req.user?.email;
+      const query = { email };
+      const result = await usersCollection.findOne(query);
+
+      if (!result || result?.role !== "seller") {
+        res.status(403).send({
+          message: "Forbidden access! Seller only action!!",
+        });
+      }
+
+      next();
+    };
+
     // save or update users in db
     app.post("/users/:email", async (req, res) => {
+      sendEmail();
       const email = req.params.email;
       const query = { email };
       const user = req.body;
@@ -91,6 +174,49 @@ async function run() {
       };
 
       const result = await usersCollection.updateOne(query, updateDoc);
+      res.send(result);
+    });
+
+    // get all users data
+    app.get("/all-users/:email", verifyToken, verifyAdmin, async (req, res) => {
+      const email = req.params.email;
+      const query = { email: { $ne: email } };
+      const result = await usersCollection.find(query).toArray();
+      res.send(result);
+    });
+
+    // update a user role and status
+    app.patch(
+      "/user/role/:email",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        const email = req.params.email;
+        const { role } = req.body;
+        const filter = { email };
+        const updateDoc = {
+          $set: { role, status: "Verified" },
+        };
+        const result = await usersCollection.updateOne(filter, updateDoc);
+        res.send(result);
+      }
+    );
+
+    // get all inventory data for seller
+    app.get("/plants/seller", verifyToken, verifySeller, async (req, res) => {
+      const email = req.user.email;
+      // const query = { email: { $ne: email } };
+      const result = await plantsCollection
+        .find({ "seller.email": email })
+        .toArray();
+      res.send(result);
+    });
+
+    // delete a plant from db by seller
+    app.delete("/plants/:id", verifyToken, verifySeller, async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
+      const result = await plantsCollection.deleteOne(query);
       res.send(result);
     });
 
@@ -131,7 +257,7 @@ async function run() {
     });
 
     //save a plant in the database
-    app.post("/plants", verifyToken, async (req, res) => {
+    app.post("/plants", verifyToken, verifySeller, async (req, res) => {
       const plants = req.body;
       const result = await plantsCollection.insertOne(plants);
       res.send(result);
@@ -156,6 +282,20 @@ async function run() {
       const orderInfo = req.body;
       console.log(orderInfo);
       const result = await ordersCollection.insertOne(orderInfo);
+      // send email
+      if (result?.insertedId) {
+        // To customer
+        sendEmail(orderInfo?.customer?.email, {
+          subject: "Order Successful",
+          message: `You have placed an order successfully. Transaction id: ${result?.insertedId}`,
+        });
+
+        // To seller
+        sendEmail(orderInfo?.seller, {
+          subject: "Hurry!, You have an order to process",
+          message: `Get the plants ready for ${orderInfo?.customer?.name}`,
+        });
+      }
       res.send(result);
     });
 
@@ -224,6 +364,67 @@ async function run() {
           },
         ])
         .toArray();
+      res.send(result);
+    });
+
+    // get all orders for a specific seller
+    app.get(
+      "/seller-orders/:email",
+      verifyToken,
+      verifySeller,
+      async (req, res) => {
+        const email = req.params.email;
+        const query = { seller: email };
+        // const result = await ordersCollection.find(query).toArray();
+        const result = await ordersCollection
+          .aggregate([
+            {
+              $match: query, // match specific customers data only by email
+            },
+            {
+              $addFields: {
+                plantId: { $toObjectId: "$plantId" }, // convert plantId string field to objectId field
+              },
+            },
+            {
+              $lookup: {
+                // go to a different collection and look for data
+                from: "plants", // fetch something from plants collection
+                localField: "plantId", // local data that i want to match
+                foreignField: "_id", // foreign field name to match the exact things that i need
+                as: "plants", // return the data as plants array (here plants will be the name of returned array)
+              },
+            },
+            {
+              $unwind: "$plants", // unwind lookup result, so that it returns without array
+            },
+            {
+              $addFields: {
+                // add the below below to the order object
+                name: "$plants.name",
+              },
+            },
+            {
+              // remove plants object property from order object
+              $project: {
+                plants: 0, // 0 means remove and 1 means add that specific property
+              },
+            },
+          ])
+          .toArray();
+        res.send(result);
+      }
+    );
+
+    // update a order status
+    app.patch("/orders/:id", verifyToken, verifySeller, async (req, res) => {
+      const id = req.params.id;
+      const { status } = req.body;
+      const filter = { _id: new ObjectId(id) };
+      const updateDoc = {
+        $set: { status },
+      };
+      const result = await ordersCollection.updateOne(filter, updateDoc);
       res.send(result);
     });
 
